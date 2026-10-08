@@ -60,9 +60,11 @@ func (w *WorkerDefaults) GetBaseContainer(context ComponentContext) (corev1.Cont
 		FailureThreshold: livenessFailureThreshold,
 	}
 
-	// ReadinessProbe in Dynamo worker context doesn't determine that the worker is ready to receive traffic
-	// Since worker registration is done through external KvStore and Transport does not use Kubernetes Service
-	// Still important for external depencies that rely on Pod Readiness
+	// Under etcd discovery, readiness doesn't decide whether a worker gets traffic: the frontend
+	// routes to workers whose model card is registered in the KvStore, not through a Service.
+	// It still gates rollouts and anything else that relies on Pod readiness, and under
+	// Kubernetes discovery it also keeps the worker out of the EndpointSlice. Worker validation
+	// gates (DYN_WORKER_VALIDATION_GATES) hold both /health and the model card.
 	container.ReadinessProbe = &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{

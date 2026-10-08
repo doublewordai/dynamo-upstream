@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Aggregated vLLM worker with validation gates. Each new worker runs two checks
+# against itself before it becomes routable:
+#
+# * "completion" (exec): runs in the worker container.
+# * "smoke" (url): POSTs to a check-runner sidecar with its own image, which runs
+#   the configured command.
+#
+# Until both pass, the worker's model card is held (no traffic) and /health is
+# 503 (pod not Ready), so a rolling update with maxUnavailable 0 waits on the new
+# pod while the old pods keep serving. A failing check stalls the rollout; fix
+# the check or roll back. See docs: kubernetes/fault-tolerance/validation-gates.
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: vllm-agg-validation-gates
+spec:
+  components:
+  - name: Frontend
+    podTemplate:
+      spec:
+        containers:
+        - envFrom:
+          - secretRef:
+              name: hf-token-secret
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          name: main
+    replicas: 1
+    type: frontend
+  - name: worker
+    podTemplate:
+      metadata:
+        annotations:
+          # Surge a validated worker in before an old one leaves.
+          nvidia.com/deployment-rolling-update-max-surge: "1"
+          nvidia.com/deployment-rolling-update-max-unavailable: "0"
+      spec:
+        containers:
+        - args:
+          - --model
+          - Qwen/Qwen3-0.6B
+          command:
+          - python3
+          - -m
+          - dynamo.vllm
+          env:
+          - name: DYN_WORKER_VALIDATION_GATES
+            value: |
+              {
+                "completion": {"exec": ["python3", "-m", "dynamo.validation.completion"], "timeout_secs": 600},
+                "smoke": {"url": "http://127.0.0.1:9100/validate/smoke", "timeout_secs": 900}
+              }
+          envFrom:
+          - secretRef:
+              name: hf-token-secret
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          name: main
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              ephemeral-storage: 2Gi
+          workingDir: /workspace/examples/backends/vllm
+        # Stateless check runner for the "smoke" url gate. It has no probes and
+        # never exits on a failed check, so it can't make a released pod
+        # NotReady. Replace the command with your own checks and image.
+        - name: check-runner
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          command:
+          - python3
+          - -m
+          - dynamo.validation.runner
+          - --port
+          - "9100"
+          - --check
+          - smoke=builtin:completion
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+    replicas: 2
+    type: worker

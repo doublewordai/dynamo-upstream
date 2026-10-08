@@ -793,9 +793,10 @@ pub struct HttpServiceConfig {
     #[builder(default = "None")]
     drt_discovery: Option<Arc<dyn Discovery>>,
 
-    /// When true, serve the RL worker discovery API on `rl_port`.
-    #[builder(default = "false")]
-    enable_rl: bool,
+    /// Serve the RL worker discovery API on `rl_port`. Unset follows
+    /// `DYN_ENABLE_RL`; `false` keeps it off even when that is set.
+    #[builder(setter(strip_option), default = "None")]
+    enable_rl: Option<bool>,
 
     /// Master switch for the `nvext` extension protocol. Default `true`;
     /// env-truthy `DYN_DISABLE_FRONTEND_NVEXT` overrides to `false`.
@@ -1500,7 +1501,9 @@ impl HttpServiceConfigBuilder {
         // Echo x-request-id from request to response headers for client correlation
         let router = router.layer(axum::middleware::from_fn(echo_request_id_header));
 
-        let enable_rl_router = config.enable_rl || env_is_truthy("DYN_ENABLE_RL");
+        let enable_rl_router = config
+            .enable_rl
+            .unwrap_or_else(|| env_is_truthy("DYN_ENABLE_RL"));
         let rl_router = if enable_rl_router {
             let Some(drt) = config.runtime.as_ref() else {
                 return Err(anyhow::anyhow!(

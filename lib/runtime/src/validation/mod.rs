@@ -108,6 +108,7 @@ pub struct WorkerValidation {
     release_hooks: parking_lot::Mutex<Vec<ReleaseHook>>,
     released: watch::Sender<bool>,
     started: AtomicBool,
+    local_endpoint_claimed: AtomicBool,
     metrics: std::sync::OnceLock<Metrics>,
 }
 
@@ -141,6 +142,7 @@ impl WorkerValidation {
             release_hooks: parking_lot::Mutex::new(Vec::new()),
             released: watch::channel(false).0,
             started: AtomicBool::new(false),
+            local_endpoint_claimed: AtomicBool::new(false),
             metrics: std::sync::OnceLock::new(),
         })
     }
@@ -178,6 +180,12 @@ impl WorkerValidation {
         }
         hooks.push(hook);
         true
+    }
+
+    /// Claim the right to serve the loopback endpoint that gates check. Only
+    /// the first caller gets `true`; a worker serves one model to its gates.
+    pub fn claim_local_endpoint(&self) -> bool {
+        !self.local_endpoint_claimed.swap(true, Ordering::SeqCst)
     }
 
     /// Gate state for the `/health` body.

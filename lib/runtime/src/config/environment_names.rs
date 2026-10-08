@@ -183,6 +183,11 @@ pub mod runtime {
 
         /// What a worker holds until its gates pass: `card` (default) or `health`.
         pub const DYN_WORKER_VALIDATION_HOLD: &str = "DYN_WORKER_VALIDATION_HOLD";
+
+        /// Port for the loopback OpenAI endpoint that gates check, bound on
+        /// `127.0.0.1` only while gates are configured. Unset or `0` picks an
+        /// ephemeral port; gates are told the URL in `OPENAI_BASE_URL`.
+        pub const DYN_WORKER_VALIDATION_LOCAL_PORT: &str = "DYN_WORKER_VALIDATION_LOCAL_PORT";
     }
 
     /// Canary deployment configuration

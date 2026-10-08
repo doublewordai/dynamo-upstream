@@ -1795,7 +1795,11 @@ mod integration_tests {
                     }
                 };
 
-                // No local engine yet, so the gates have not started.
+                // A local engine alone does not start the gates: they wait for
+                // the loopback OpenAI endpoint, which dynamo-llm starts.
+                drt.local_endpoint_registry()
+                    .register("generate".into(), Arc::new(StubEngine));
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 let (status, body) = get("/live").await;
                 assert_eq!(status, 200, "{body}");
                 assert!(body.get("validation").is_none(), "{body}");
@@ -1804,9 +1808,11 @@ mod integration_tests {
                 assert_eq!(body["validation"]["released"], false);
                 assert_eq!(body["validation"]["gates"]["smoke"]["state"], "pending");
 
-                // Registering the engine starts the gates; a pass releases /health.
-                drt.local_endpoint_registry()
-                    .register("generate".into(), Arc::new(StubEngine));
+                // Starting the gates and passing them releases /health.
+                drt.worker_validation().unwrap().start(
+                    crate::validation::GateEnv::default(),
+                    tokio_util::sync::CancellationToken::new(),
+                );
                 tokio::time::timeout(
                     Duration::from_secs(5),
                     drt.worker_validation().unwrap().wait_released(),
@@ -1835,8 +1841,10 @@ mod integration_tests {
             async {
                 let drt = Arc::new(create_test_drt_async().await);
                 let addr = drt.system_status_server_info().unwrap().socket_addr;
-                drt.local_endpoint_registry()
-                    .register("generate".into(), Arc::new(StubEngine));
+                drt.worker_validation().unwrap().start(
+                    crate::validation::GateEnv::default(),
+                    tokio_util::sync::CancellationToken::new(),
+                );
                 let client = reqwest::Client::new();
                 let mut body = serde_json::Value::Null;
                 for _ in 0..100 {

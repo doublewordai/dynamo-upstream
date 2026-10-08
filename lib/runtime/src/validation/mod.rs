@@ -284,19 +284,27 @@ impl WorkerValidation {
             return;
         }
 
-        let hooks = std::mem::take(&mut *self.release_hooks.lock());
-        for hook in hooks {
-            if let Err(error) = hook().await {
-                let reason = format!("{error:#}");
-                tracing::error!(%reason, "Validation release failed; worker stays held");
-                self.set_state(PUBLISH_GATE, GateState::Failed { reason }, None);
-                return;
+        // Hooks can be added while earlier ones run, so drain until none are
+        // left. The release flips under the hooks lock, after which
+        // `add_release_hook` refuses new hooks.
+        loop {
+            let hooks = {
+                let mut hooks = self.release_hooks.lock();
+                if hooks.is_empty() {
+                    self.released.send_replace(true);
+                    break;
+                }
+                std::mem::take(&mut *hooks)
+            };
+            for hook in hooks {
+                if let Err(error) = hook().await {
+                    let reason = format!("{error:#}");
+                    tracing::error!(%reason, "Validation release failed; worker stays held");
+                    self.set_state(PUBLISH_GATE, GateState::Failed { reason }, None);
+                    return;
+                }
             }
         }
-
-        // Late hooks are refused once this flips; see `add_release_hook`.
-        let _hooks = self.release_hooks.lock();
-        self.released.send_replace(true);
         tracing::info!("Worker validation passed; worker released");
     }
 
@@ -416,6 +424,30 @@ mod tests {
         assert_eq!(*order.lock(), vec![0, 1, 2]);
         // Released workers refuse new hooks so callers do the work directly.
         assert!(!validation.add_release_hook(Box::new(|| Box::pin(async { Ok(()) }))));
+    }
+
+    #[tokio::test]
+    async fn a_hook_added_while_hooks_run_still_runs_before_release() {
+        let validation = validation(r#"{"a": {"exec": ["true"], "timeout_secs": 5}}"#);
+        let late_ran = Arc::new(AtomicBool::new(false));
+        let outer = Arc::clone(&validation);
+        let flag = Arc::clone(&late_ran);
+        validation.add_release_hook(Box::new(move || {
+            Box::pin(async move {
+                let observed = Arc::clone(&outer);
+                assert!(outer.add_release_hook(Box::new(move || {
+                    Box::pin(async move {
+                        assert!(!observed.is_released());
+                        flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })));
+                Ok(())
+            })
+        }));
+        validation.start(GateEnv::default(), CancellationToken::new());
+        validation.wait_released().await;
+        assert!(late_ran.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

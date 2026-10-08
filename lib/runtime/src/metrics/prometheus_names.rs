@@ -544,6 +544,18 @@ pub mod distributed_runtime {
     pub const UPTIME_SECONDS: &str = "uptime_seconds";
 }
 
+/// Worker validation gates
+pub mod worker_validation {
+    /// Gate verdict: 0 undecided, 1 passed, -1 failed
+    pub const GATE_STATE: &str = "worker_validation_gate_state";
+
+    /// Time a gate took to reach its verdict
+    pub const GATE_DURATION_SECONDS: &str = "worker_validation_gate_duration_seconds";
+
+    /// Label carrying the gate name
+    pub const GATE_LABEL: &str = "gate";
+}
+
 /// KVBM
 pub mod kvbm {
     /// The number of offload blocks from device to host

@@ -175,6 +175,16 @@ pub mod runtime {
         pub const PREFIX: &str = "DYN_COMPUTE_";
     }
 
+    /// Worker validation gates
+    pub mod validation {
+        /// JSON map of gate name to `{"exec": [...]}` or `{"url": "..."}` with
+        /// `timeout_secs`. Unset disables validation.
+        pub const DYN_WORKER_VALIDATION_GATES: &str = "DYN_WORKER_VALIDATION_GATES";
+
+        /// What a worker holds until its gates pass: `card` (default) or `health`.
+        pub const DYN_WORKER_VALIDATION_HOLD: &str = "DYN_WORKER_VALIDATION_HOLD";
+    }
+
     /// Canary deployment configuration
     pub mod canary {
         /// Wait time in seconds for canary deployments

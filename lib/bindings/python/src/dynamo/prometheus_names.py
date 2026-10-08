@@ -655,3 +655,14 @@ class work_handler:
         PUBLISH_RESPONSE = "publish_response"
         # Final message publishing error
         PUBLISH_FINAL = "publish_final"
+
+
+class worker_validation:
+    """Worker validation gates"""
+
+    # Gate verdict: 0 undecided, 1 passed, -1 failed
+    GATE_STATE = "worker_validation_gate_state"
+    # Time a gate took to reach its verdict
+    GATE_DURATION_SECONDS = "worker_validation_gate_duration_seconds"
+    # Label carrying the gate name
+    GATE_LABEL = "gate"

@@ -639,6 +639,47 @@ impl DiscoverySpec {
         })
     }
 
+    /// Replace the caller-managed taints on a model spec that has not been
+    /// registered yet, with the same rules as [`Discovery::update_model_taints`].
+    pub fn with_model_taints(self, taints: HashSet<String>) -> Result<Self> {
+        let Self::Model {
+            namespace,
+            component,
+            endpoint,
+            card_json,
+            model_suffix,
+        } = self
+        else {
+            anyhow::bail!("model taint update requires a model discovery spec")
+        };
+        let instance = DiscoveryInstance::Model {
+            namespace,
+            component,
+            endpoint,
+            instance_id: 0,
+            card_json,
+            model_suffix,
+        };
+        let DiscoveryInstance::Model {
+            namespace,
+            component,
+            endpoint,
+            card_json,
+            model_suffix,
+            ..
+        } = model_with_updated_taints(&instance, taints)?
+        else {
+            unreachable!("taint update preserves the instance kind")
+        };
+        Ok(Self::Model {
+            namespace,
+            component,
+            endpoint,
+            card_json,
+            model_suffix,
+        })
+    }
+
     /// Converts this registration spec into a discovery instance.
     ///
     /// Endpoint and model specs use `default_instance_id`, normally the

@@ -78,6 +78,7 @@ class VirtualConnector(PlannerConnector):
         self.worker_info_provider = worker_info_provider
         self._worker_info: dict[SubComponentType, WorkerInfo] = {}
         self._worker_clients: dict[SubComponentType, tuple[str, Any]] = {}
+        self._card_trackers: dict[SubComponentType, tuple[str, Any]] = {}
 
     def get_worker_info(
         self,
@@ -246,7 +247,53 @@ class VirtualConnector(PlannerConnector):
             await asyncio.sleep(0.1)
         else:
             client = cached[1]
-        return len(client.instance_ids())
+        instance_ids = client.instance_ids()
+        # Only workers with a model card can serve. A worker held by
+        # validation gates has an endpoint but no card yet, so count it once
+        # its card is published.
+        card_ids = self._model_card_worker_ids(sub_component_type, endpoint_name)
+        if card_ids is None:
+            return len(instance_ids)
+        return sum(1 for instance_id in instance_ids if str(instance_id) in card_ids)
+
+    def _model_card_worker_ids(
+        self, sub_component_type: SubComponentType, endpoint_name: str
+    ) -> Optional[set[str]]:
+        """IDs of workers on ``endpoint_name`` whose model card is published.
+
+        Returns None when cards can't be tracked, so the caller falls back to
+        counting endpoint instances.
+        """
+        cached = self._card_trackers.get(sub_component_type)
+        if cached is None or cached[0] != endpoint_name:
+            tracker = self._new_card_tracker(endpoint_name)
+            if tracker is None:
+                return None
+            if cached is not None:
+                cached[1].shutdown()
+            self._card_trackers[sub_component_type] = (endpoint_name, tracker)
+        else:
+            tracker = cached[1]
+        try:
+            return set(tracker.get_model_cards())
+        except RuntimeError:
+            return None
+
+    def _new_card_tracker(self, endpoint_name: str) -> Optional[Any]:
+        try:
+            # Avoid loading binding-heavy dynamo.llm until it's needed.
+            from dynamo.llm import FpmEventSubscriber
+
+            tracker = FpmEventSubscriber(self.runtime.endpoint(endpoint_name))
+            tracker.start_tracking()
+            return tracker
+        except Exception:
+            logger.warning(
+                "Cannot track model cards for %s; counting endpoint instances",
+                endpoint_name,
+                exc_info=True,
+            )
+            return None
 
     def get_model_name(
         self, require_prefill: bool = True, require_decode: bool = True

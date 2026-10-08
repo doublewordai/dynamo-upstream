@@ -88,6 +88,11 @@ def _make_connector(monkeypatch, *, instances_by_endpoint, scaling_ready):
         MagicMock(return_value=coordinator),
     )
     monkeypatch.setattr(virtual.asyncio, "sleep", AsyncMock())
+    # Without bindings, model cards can't be tracked; tests that need them
+    # install a fake tracker.
+    monkeypatch.setattr(
+        virtual.VirtualConnector, "_new_card_tracker", lambda self, name: None
+    )
     runtime = _Runtime(instances_by_endpoint)
     connector = virtual.VirtualConnector(
         runtime=runtime,
@@ -284,3 +289,60 @@ async def test_add_component_preserves_existing_desired_count(monkeypatch):
 
     coordinator.update_scaling_decision.assert_awaited_once_with(5, None)
     assert runtime.endpoint_calls == []
+
+
+class _CardTracker:
+    def __init__(self, worker_ids: list[str]) -> None:
+        self.worker_ids = worker_ids
+        self.shutdown_calls = 0
+
+    def get_model_cards(self) -> dict[str, str]:
+        return {worker_id: "{}" for worker_id in self.worker_ids}
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_workers_without_a_model_card_are_not_counted(monkeypatch):
+    # A worker held by validation gates has an endpoint but no card yet.
+    connector, _, _ = _make_connector(
+        monkeypatch,
+        instances_by_endpoint={"test-ns.backend.generate": [1, 2, 3]},
+        scaling_ready=True,
+    )
+    tracker = _CardTracker(["1", "3"])
+    monkeypatch.setattr(
+        virtual.VirtualConnector, "_new_card_tracker", lambda self, name: tracker
+    )
+
+    counts = await connector.get_actual_worker_counts(decode_component_name="decode")
+    assert counts == (0, 2, True)
+
+    # The card is published on release, and the worker is counted.
+    tracker.worker_ids.append("2")
+    counts = await connector.get_actual_worker_counts(decode_component_name="decode")
+    assert counts == (0, 3, True)
+    assert tracker.shutdown_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_untracked_cards_fall_back_to_endpoint_instances(monkeypatch):
+    connector, _, _ = _make_connector(
+        monkeypatch,
+        instances_by_endpoint={"test-ns.backend.generate": [1, 2]},
+        scaling_ready=True,
+    )
+
+    class _NotStarted(_CardTracker):
+        def get_model_cards(self) -> dict[str, str]:
+            raise RuntimeError("start_tracking() has not been called")
+
+    monkeypatch.setattr(
+        virtual.VirtualConnector,
+        "_new_card_tracker",
+        lambda self, name: _NotStarted([]),
+    )
+
+    counts = await connector.get_actual_worker_counts(decode_component_name="decode")
+    assert counts == (0, 2, True)

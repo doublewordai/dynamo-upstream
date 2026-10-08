@@ -486,12 +486,18 @@ pub async fn register_model_card(
         endpoint.component().name().to_string(),
         endpoint.name().to_string(),
         &wire_card,
-        model_suffix,
+        model_suffix.clone(),
     )?;
-    let _instance = discovery.register(spec).await?;
+    // Under worker validation the discovery write may be held until release.
+    // Capacity is still recorded now: it sizes this process, not routing.
+    if let Some(spec) =
+        crate::validation_hold::hold_card(endpoint, model_suffix.as_deref(), spec).await
+    {
+        let _instance = discovery.register(spec).await?;
+    }
 
     // Size the process-global admission gate from this card, after registration
-    // succeeds. LoRA adapters carry no capacity of their own.
+    // succeeds or is held. LoRA adapters carry no capacity of their own.
     if lora_name.is_none() {
         dynamo_runtime::admission_gate::record_engine_capacity(
             card.runtime_config.max_num_seqs,
@@ -506,6 +512,9 @@ pub async fn update_model_taints(
     endpoint: &Endpoint,
     taints: HashSet<String>,
 ) -> anyhow::Result<()> {
+    if crate::validation_hold::update_held_taints(endpoint, &taints).await? {
+        return Ok(());
+    }
     let endpoint_id = endpoint.id();
     let instance_id = endpoint.drt().connection_id();
     let discovery = endpoint.drt().discovery();
@@ -853,8 +862,10 @@ impl LocalModel {
             model_suffix,
         };
 
-        let discovery = drt.discovery();
-        discovery.unregister(instance).await?;
+        // A card held by worker validation was never written.
+        if !crate::validation_hold::forget_held(endpoint, registry_owner.1.as_deref()).await {
+            drt.discovery().unregister(instance).await?;
+        }
         drt.metadata_artifacts()
             .unregister_for_owner(&registry_owner);
 

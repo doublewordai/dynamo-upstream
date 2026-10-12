@@ -78,10 +78,14 @@ struct HeldCard {
 static HELD: LazyLock<tokio::sync::Mutex<HashMap<HeldKey, HeldCard>>> =
     LazyLock::new(Default::default);
 
+/// A card written by the release in progress, and the discovery it was
+/// written to.
+type PublishedCard = (Arc<dyn Discovery>, DiscoveryInstance);
+
 /// Cards written by the release in progress. If a later card's write fails,
 /// these are unregistered again, so a worker whose `publish` gate failed has
 /// no routable card.
-static PUBLISHED: LazyLock<tokio::sync::Mutex<Vec<(Arc<dyn Discovery>, DiscoveryInstance)>>> =
+static PUBLISHED: LazyLock<tokio::sync::Mutex<Vec<PublishedCard>>> =
     LazyLock::new(Default::default);
 
 /// Hold `spec` if this worker's validation requires it. Returns the spec back

@@ -65,7 +65,9 @@ spec:
           workingDir: /workspace/examples/backends/vllm
         # Stateless check runner for the "smoke" url gate. It has no probes and
         # never exits on a failed check, so it can't make a released pod
-        # NotReady. Replace the command with your own checks and image.
+        # NotReady. Replace the command with your own checks and image; the
+        # runner itself needs only Python and aiohttp (a dependency of both
+        # the ai-dynamo wheel and vLLM).
         - name: check-runner
           image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
           command:

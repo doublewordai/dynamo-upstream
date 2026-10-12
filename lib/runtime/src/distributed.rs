@@ -477,8 +477,19 @@ impl DistributedRuntime {
                     tracing::info!(%address, ?policy, "System HTTP listener started");
                 }
                 // Preserve ordinary workers' optional-HTTP failure behavior.
-                Err(error) if policy == system_status_server::SystemProbePolicy::Worker => {
+                // Validation gates hold readiness through /health, so for them
+                // a worker with no status server would be held with nothing to
+                // show it.
+                Err(error)
+                    if policy == system_status_server::SystemProbePolicy::Worker
+                        && distributed_runtime.worker_validation.is_none() =>
+                {
                     tracing::error!(%error, "System status server startup failed");
+                }
+                Err(error) if policy == system_status_server::SystemProbePolicy::Worker => {
+                    return Err(error.context(
+                        "worker validation gates hold /health, so the system status server must start",
+                    ));
                 }
                 Err(error) => return Err(error),
             }

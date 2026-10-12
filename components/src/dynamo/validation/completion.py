@@ -55,11 +55,19 @@ def check_completion(
     except (urllib.error.URLError, OSError, ValueError) as error:
         return f"chat completion failed: {error}"
 
+    if not isinstance(payload, dict):
+        return f"chat completion returned {type(payload).__name__}, not an object"
     choices = payload.get("choices") or []
     if not choices:
         return f"chat completion returned no choices: {json.dumps(payload)[:500]}"
     message = choices[0].get("message") or {}
-    content = message.get("content") or message.get("reasoning_content")
+    # A reasoning-only reply lands in `reasoning_content`, or `reasoning` when
+    # the worker sets DYN_REASONING_FIELD_NAME.
+    content = (
+        message.get("content")
+        or message.get("reasoning_content")
+        or message.get("reasoning")
+    )
     if not content and not message.get("tool_calls"):
         return f"chat completion returned an empty message: {json.dumps(message)[:500]}"
     return None

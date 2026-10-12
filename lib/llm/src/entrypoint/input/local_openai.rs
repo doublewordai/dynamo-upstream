@@ -46,22 +46,58 @@ use crate::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest
 /// Binds before returning, so a bad `DYN_WORKER_VALIDATION_LOCAL_PORT` or a
 /// port in use fails model registration instead of leaving the worker held
 /// with no gates running.
+///
+/// A card the endpoint can't serve (prefill, encode, embeddings, text input)
+/// still starts the gates, without `OPENAI_BASE_URL`: `exec` gates that don't
+/// need the endpoint can pass, and anything else fails with a reason instead
+/// of holding the worker silently.
 pub async fn serve_if_gated(endpoint: &Endpoint, card: &ModelDeploymentCard) -> anyhow::Result<()> {
     let drt = endpoint.drt();
     let Some(validation) = drt.worker_validation() else {
         return Ok(());
     };
-    if !servable(card) {
-        tracing::debug!(
+    if !validation.claim_local_endpoint() {
+        tracing::info!(
             model = %card.display_name,
-            "Card has no token chat or completions surface; not serving it to validation gates"
+            "Validation gates already run against an earlier card; this one is not checked"
         );
         return Ok(());
     }
-    if !validation.claim_local_endpoint() {
+    if !servable(card) {
+        tracing::warn!(
+            model = %card.display_name,
+            "Card has no token chat or completions surface; validation gates run without OPENAI_BASE_URL"
+        );
+        tokio::spawn(start_gates_when_registered(
+            Arc::clone(validation),
+            drt.local_endpoint_registry().clone(),
+            endpoint.name().to_string(),
+            GateEnv {
+                openai_base_url: None,
+                model: Some(card.display_name.clone()),
+            },
+            drt.child_token(),
+            CancellationToken::new(),
+        ));
         return Ok(());
     }
 
+    match serve(endpoint, card, validation).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Let a later card try; this one failed before anything started.
+            validation.release_local_endpoint_claim();
+            Err(error)
+        }
+    }
+}
+
+async fn serve(
+    endpoint: &Endpoint,
+    card: &ModelDeploymentCard,
+    validation: &Arc<WorkerValidation>,
+) -> anyhow::Result<()> {
+    let drt = endpoint.drt();
     let port = local_port()?;
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await

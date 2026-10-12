@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use dynamo_runtime::component::Endpoint;
-use dynamo_runtime::discovery::{Discovery, DiscoverySpec};
+use dynamo_runtime::discovery::{Discovery, DiscoveryInstance, DiscoverySpec};
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::validation::HoldMode;
 use std::sync::Arc;
@@ -71,35 +71,63 @@ struct HeldCard {
     spec: DiscoverySpec,
 }
 
-/// Cards held by every runtime in this process. An async lock, so a release
-/// write and a concurrent taint update or unregister for the same card are
-/// ordered: whichever runs second sees the card written or gone.
+/// Cards held by every runtime in this process. The lock is never held across
+/// a discovery write: a release copies the card out, writes it, then checks
+/// the map again, so a taint update or unregister that lands mid-write is
+/// honoured (see [`publish_held`]).
 static HELD: LazyLock<tokio::sync::Mutex<HashMap<HeldKey, HeldCard>>> =
+    LazyLock::new(Default::default);
+
+/// Cards written by the release in progress. If a later card's write fails,
+/// these are unregistered again, so a worker whose `publish` gate failed has
+/// no routable card.
+static PUBLISHED: LazyLock<tokio::sync::Mutex<Vec<(Arc<dyn Discovery>, DiscoveryInstance)>>> =
     LazyLock::new(Default::default);
 
 /// Hold `spec` if this worker's validation requires it. Returns the spec back
 /// when it should be written now: no gates, `hold=health`, or already released.
+///
+/// Discovery refuses a second, different model on the same endpoint path. The
+/// held map applies the same rule, so a worker can't park two models under
+/// one key and have one silently dropped.
 pub(crate) async fn hold_card(
     endpoint: &Endpoint,
     model_suffix: Option<&str>,
     spec: DiscoverySpec,
-) -> Option<DiscoverySpec> {
+) -> anyhow::Result<Option<DiscoverySpec>> {
     let drt = endpoint.drt();
     let Some(validation) = drt.worker_validation() else {
-        return Some(spec);
+        return Ok(Some(spec));
     };
     if validation.hold_mode() != HoldMode::Card || validation.is_released() {
-        return Some(spec);
+        return Ok(Some(spec));
     }
 
     let key = HeldKey::new(endpoint, model_suffix);
-    HELD.lock().await.insert(
-        key.clone(),
-        HeldCard {
-            discovery: drt.discovery(),
-            spec,
-        },
-    );
+    {
+        let mut held = HELD.lock().await;
+        if let Some(existing) = held.get(&key) {
+            let (existing_name, requested_name) =
+                (display_name(&existing.spec), display_name(&spec));
+            if existing_name != requested_name {
+                let id = endpoint.id();
+                anyhow::bail!(
+                    "Cannot register model '{requested_name}' on endpoint \
+                     '{}/{}/{}': a different model '{existing_name}' is already registered there",
+                    id.namespace,
+                    id.component,
+                    id.name
+                );
+            }
+        }
+        held.insert(
+            key.clone(),
+            HeldCard {
+                discovery: drt.discovery(),
+                spec,
+            },
+        );
+    }
 
     let hook_key = key.clone();
     let added = validation.add_release_hook(Box::new(move || {
@@ -107,23 +135,82 @@ pub(crate) async fn hold_card(
     }));
     if !added {
         // Released between the check above and now: write it directly.
-        return HELD.lock().await.remove(&key).map(|held| held.spec);
+        return Ok(HELD.lock().await.remove(&key).map(|held| held.spec));
     }
+    // Whatever fails the release, no card written by it may stay routable.
+    validation.add_rollback_hook(Box::new(|| Box::pin(rollback_published())));
     tracing::info!(card = %key, "Holding model card until worker validation passes");
-    None
+    Ok(None)
+}
+
+fn display_name(spec: &DiscoverySpec) -> String {
+    match spec {
+        DiscoverySpec::Model { card_json, .. } => card_json
+            .get("display_name")
+            .and_then(|name| name.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Write a held card. The card may have been unregistered while held, or
 /// already written by an earlier hook for the same key.
+///
+/// The write happens with the map unlocked. If the card changed meanwhile (a
+/// taint update), it's written again; if it was unregistered, the write is
+/// undone. On a final failure every card this release has written so far is
+/// unregistered, and the error fails the worker's `publish` gate.
 async fn publish_held(key: &HeldKey) -> anyhow::Result<()> {
-    let mut held = HELD.lock().await;
-    let Some(card) = held.get(key) else {
-        return Ok(());
-    };
+    loop {
+        let (discovery, spec) = {
+            let held = HELD.lock().await;
+            let Some(card) = held.get(key) else {
+                return Ok(());
+            };
+            (Arc::clone(&card.discovery), card.spec.clone())
+        };
+
+        // On failure the rollback hook unregisters what earlier hooks wrote.
+        let instance = register_with_retry(&discovery, &spec, key).await?;
+        PUBLISHED
+            .lock()
+            .await
+            .push((Arc::clone(&discovery), instance.clone()));
+
+        let mut held = HELD.lock().await;
+        match held.get(key) {
+            Some(card) if card.spec == spec => {
+                held.remove(key);
+                tracing::info!(card = %key, "Published held model card");
+                return Ok(());
+            }
+            Some(_) => {
+                // Edited during the write: write the current card over it.
+                tracing::debug!(card = %key, "Held model card changed during its write; rewriting");
+            }
+            None => {
+                // Unregistered during the write: the card must not exist.
+                drop(held);
+                discovery
+                    .unregister(instance)
+                    .await
+                    .with_context(|| format!("undoing the write of unregistered card {key}"))?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn register_with_retry(
+    discovery: &Arc<dyn Discovery>,
+    spec: &DiscoverySpec,
+    key: &HeldKey,
+) -> anyhow::Result<DiscoveryInstance> {
     let mut attempt = 1;
     loop {
-        match card.discovery.register(card.spec.clone()).await {
-            Ok(_) => break,
+        match discovery.register(spec.clone()).await {
+            Ok(instance) => return Ok(instance),
             Err(error) if attempt < PUBLISH_ATTEMPTS => {
                 tracing::warn!(card = %key, attempt, %error, "Retrying held model card write");
                 attempt += 1;
@@ -134,9 +221,21 @@ async fn publish_held(key: &HeldKey) -> anyhow::Result<()> {
             }
         }
     }
-    held.remove(key);
-    tracing::info!(card = %key, "Published held model card");
-    Ok(())
+}
+
+/// Unregister every card this release wrote. Best effort: a card that can't
+/// be removed is logged, and the worker stays held either way.
+async fn rollback_published() {
+    let published = std::mem::take(&mut *PUBLISHED.lock().await);
+    for (discovery, instance) in published {
+        if let Err(error) = discovery.unregister(instance.clone()).await {
+            tracing::error!(
+                %error,
+                instance_id = instance.instance_id(),
+                "Could not roll back a model card written by a failed release"
+            );
+        }
+    }
 }
 
 /// Apply a taint update to this worker's held base-model card. Returns
@@ -410,6 +509,74 @@ mod tests {
         }
         assert_eq!(validation.status_json()["gates"]["g"]["state"], "failed");
         assert!(model_cards(&drt).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_different_model_on_the_same_endpoint_is_rejected_while_held() {
+        let drt = gated_drt(GATES_PASS, None).await;
+        let endpoint = drt
+            .namespace("ns")
+            .unwrap()
+            .component("c")
+            .unwrap()
+            .endpoint("generate");
+        register_model_card(&endpoint, &card("model-a"))
+            .await
+            .unwrap();
+        let error = register_model_card(&endpoint, &card("model-b"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("a different model 'model-a' is already registered"),
+            "{error:#}"
+        );
+        // Re-registering the same model replaces the held card, as discovery
+        // would accept it.
+        register_model_card(&endpoint, &card("model-a"))
+            .await
+            .unwrap();
+        release(&drt).await;
+        assert_eq!(model_cards(&drt).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_unregisters_cards_it_already_wrote() {
+        let drt = gated_drt(GATES_PASS, None).await;
+        let endpoint = drt
+            .namespace("ns")
+            .unwrap()
+            .component("c")
+            .unwrap()
+            .endpoint("generate");
+        register_model_card(&endpoint, &card("m")).await.unwrap();
+        // A later release step fails after the card's own hook has written it.
+        let validation = drt.worker_validation().unwrap();
+        validation.add_release_hook(Box::new(|| {
+            Box::pin(async { Err(anyhow::anyhow!("later release step failed")) })
+        }));
+        validation.start(Default::default(), drt.child_token());
+        for _ in 0..100 {
+            if validation.status_json()["gates"]["publish"]["state"] == "failed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            validation.status_json()["gates"]["publish"]["state"],
+            "failed"
+        );
+        // Rollback is best effort and runs after the gate is marked failed.
+        for _ in 0..100 {
+            if model_cards(&drt).await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            model_cards(&drt).await.is_empty(),
+            "a card written by a failed release stayed routable"
+        );
+        assert!(!validation.is_released());
     }
 
     #[tokio::test]

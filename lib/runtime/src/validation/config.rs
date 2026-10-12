@@ -13,11 +13,16 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use super::PUBLISH_GATE;
 use crate::config::environment_names::runtime::validation as env_validation;
 
 /// Longest accepted gate name. Gate names become metric label values and
 /// `/health` keys, so keep them short and predictable.
 const MAX_GATE_NAME_LEN: usize = 63;
+
+/// Longest accepted `timeout_secs` (30 days). Keeps `Instant + timeout` from
+/// overflowing and catches a unit mix-up (milliseconds) at startup.
+const MAX_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// What a held worker keeps back until every gate passes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,14 +95,60 @@ struct RawGate {
     timeout_secs: Option<u64>,
 }
 
+/// The gates object. A hand-written visitor rather than a plain map, because
+/// serde would keep the last of two gates with the same name and silently drop
+/// a check.
+struct RawGates(BTreeMap<String, RawGate>);
+
+impl<'de> Deserialize<'de> for RawGates {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RawGates;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object of gate name to gate")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut gates = BTreeMap::new();
+                while let Some((name, gate)) = map.next_entry::<String, RawGate>()? {
+                    if gates.insert(name.clone(), gate).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "gate {name:?} is defined twice"
+                        )));
+                    }
+                }
+                Ok(RawGates(gates))
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// Read one variable. Unset is `None`; a value that isn't UTF-8 is an error,
+/// so a garbled setting can't start the worker unchecked.
+fn env_var(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("{name} is not valid UTF-8: {error}")),
+    }
+}
+
 impl ValidationConfig {
     /// Read the configuration from the environment.
     ///
     /// Returns `Ok(None)` when no gates are configured, which keeps today's
     /// behaviour unchanged.
     pub fn from_env() -> Result<Option<Self>> {
-        let gates = std::env::var(env_validation::DYN_WORKER_VALIDATION_GATES).ok();
-        let hold = std::env::var(env_validation::DYN_WORKER_VALIDATION_HOLD).ok();
+        let gates = env_var(env_validation::DYN_WORKER_VALIDATION_GATES)?;
+        let hold = env_var(env_validation::DYN_WORKER_VALIDATION_HOLD)?;
         Self::parse(gates.as_deref(), hold.as_deref())
     }
 
@@ -118,7 +169,7 @@ impl ValidationConfig {
 
         let hold = hold.map(str::parse).transpose()?.unwrap_or_default();
 
-        let raw: BTreeMap<String, RawGate> = serde_json::from_str(gates).with_context(|| {
+        let RawGates(raw) = serde_json::from_str(gates).with_context(|| {
             format!(
                 "{} must be a JSON object of gate name to \
                  {{\"exec\": [...]}} or {{\"url\": \"...\"}} with \"timeout_secs\"",
@@ -164,6 +215,9 @@ fn parse_gate(name: &str, gate: RawGate) -> Result<GateSpec> {
     if timeout_secs == 0 {
         bail!("\"timeout_secs\" must be greater than zero");
     }
+    if timeout_secs > MAX_TIMEOUT_SECS {
+        bail!("\"timeout_secs\" must be at most {MAX_TIMEOUT_SECS} (30 days)");
+    }
 
     Ok(GateSpec {
         name: name.to_string(),
@@ -188,6 +242,9 @@ fn validate_gate_name(name: &str) -> Result<()> {
             "gate names must be 1-{MAX_GATE_NAME_LEN} characters of a-z, 0-9, '-' or '_', \
              starting and ending with a letter or digit"
         );
+    }
+    if name == PUBLISH_GATE {
+        bail!("the gate name {PUBLISH_GATE:?} is reserved for the release step");
     }
     Ok(())
 }
@@ -336,6 +393,23 @@ mod tests {
                 Some(r#"{"a": {"exec": ["true"], "timeout_secs": 0}}"#),
                 None,
                 "greater than zero",
+            ),
+            (
+                Some(r#"{"a": {"exec": ["true"], "timeout_secs": 18446744073709551615}}"#),
+                None,
+                "at most",
+            ),
+            (
+                Some(r#"{"publish": {"exec": ["true"], "timeout_secs": 1}}"#),
+                None,
+                "reserved",
+            ),
+            (
+                Some(
+                    r#"{"a": {"exec": ["true"], "timeout_secs": 1}, "a": {"exec": ["false"], "timeout_secs": 1}}"#,
+                ),
+                None,
+                "defined twice",
             ),
             (
                 Some(r#"{"a": {"exec": ["true"], "timeout_secs": 1, "retries": 3}}"#),

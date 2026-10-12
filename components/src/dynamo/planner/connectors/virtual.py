@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional
 
 from dynamo._core import VirtualConnectorCoordinator
@@ -17,6 +18,13 @@ from dynamo.runtime.logging import configure_dynamo_logging
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+# A model-card tracker starts empty and fills from discovery's replay of
+# existing cards. Until this much time has passed, an empty snapshot is
+# "unknown", not "no workers".
+_CARD_TRACKER_SETTLE_S = 5.0
+# How long to count endpoint instances before trying to create a tracker again.
+_CARD_TRACKER_RETRY_S = 60.0
 
 # Constants for scaling readiness check and waiting
 SCALING_CHECK_INTERVAL = int(
@@ -78,7 +86,10 @@ class VirtualConnector(PlannerConnector):
         self.worker_info_provider = worker_info_provider
         self._worker_info: dict[SubComponentType, WorkerInfo] = {}
         self._worker_clients: dict[SubComponentType, tuple[str, Any]] = {}
-        self._card_trackers: dict[SubComponentType, tuple[str, Any]] = {}
+        # (endpoint name, tracker, started at)
+        self._card_trackers: dict[SubComponentType, tuple[str, Any, float]] = {}
+        # (endpoint name, failed at) for trackers that couldn't be created
+        self._card_tracker_failures: dict[SubComponentType, tuple[str, float]] = {}
 
     def get_worker_info(
         self,
@@ -261,23 +272,38 @@ class VirtualConnector(PlannerConnector):
     ) -> Optional[set[str]]:
         """IDs of workers on ``endpoint_name`` whose model card is published.
 
-        Returns None when cards can't be tracked, so the caller falls back to
-        counting endpoint instances.
+        Returns None when cards can't be tracked yet, so the caller falls back
+        to counting endpoint instances: a tracker that failed to start (retried
+        after ``_CARD_TRACKER_RETRY_S``), or one too new to have replayed the
+        existing cards.
         """
+        now = time.monotonic()
         cached = self._card_trackers.get(sub_component_type)
         if cached is None or cached[0] != endpoint_name:
+            failed = self._card_tracker_failures.get(sub_component_type)
+            if (
+                failed is not None
+                and failed[0] == endpoint_name
+                and now - failed[1] < _CARD_TRACKER_RETRY_S
+            ):
+                return None
             tracker = self._new_card_tracker(endpoint_name)
             if tracker is None:
+                self._card_tracker_failures[sub_component_type] = (endpoint_name, now)
                 return None
+            self._card_tracker_failures.pop(sub_component_type, None)
             if cached is not None:
                 cached[1].shutdown()
-            self._card_trackers[sub_component_type] = (endpoint_name, tracker)
-        else:
-            tracker = cached[1]
+            cached = (endpoint_name, tracker, now)
+            self._card_trackers[sub_component_type] = cached
+        _, tracker, started_at = cached
         try:
-            return set(tracker.get_model_cards())
+            card_ids = set(tracker.get_model_cards())
         except RuntimeError:
             return None
+        if not card_ids and now - started_at < _CARD_TRACKER_SETTLE_S:
+            return None
+        return card_ids
 
     def _new_card_tracker(self, endpoint_name: str) -> Optional[Any]:
         try:

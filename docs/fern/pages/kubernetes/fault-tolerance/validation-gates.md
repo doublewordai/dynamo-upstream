@@ -63,6 +63,7 @@ gate it stays up, so you can debug the held worker from inside the pod.
 Any OpenAI client works as a check:
 
 ```python
+import os
 from openai import OpenAI
 client = OpenAI()  # reads OPENAI_BASE_URL
 reply = client.chat.completions.create(model=os.environ["DYN_VALIDATION_MODEL"], messages=[...])
@@ -135,13 +136,16 @@ stateless HTTP server that runs one configured command per request:
 ```
 
 Gate `smoke` then points at `http://127.0.0.1:9100/validate/smoke`. The runner keeps no state; the
-worker owns every verdict.
+worker owns every verdict. A check inherits the runner container's environment plus the three gate
+variables, so a check's own credentials go on the sidecar container. The worker can set only the gate
+variables. When the worker gives up on a gate at its deadline, the runner kills the check and anything
+it started.
 
 Follow these rules for any check runner, because a sidecar's readiness counts toward the pod's:
 
 - Give it no readiness, liveness or startup probe.
 - Never exit on a failed check; answer `{"pass": false}` instead.
-- Bind loopback only.
+- Bind loopback only. The reference runner refuses any other `--host`.
 
 ## Roll out with gates
 
@@ -167,7 +171,9 @@ etcd or pod-mode Kubernetes discovery. Requests to a decode worker's loopback en
 a prefill worker. They aren't supported for:
 
 - prefill, encode, embeddings-only and text-input workers: they have no chat or completions surface,
-  so no loopback endpoint opens and their gates never start. A gated worker of this kind stays held.
+  so no loopback endpoint opens. Their gates still run, without `OPENAI_BASE_URL`, so an `exec` gate
+  that doesn't need the endpoint can pass and anything else fails with a reason. With `hold=health`
+  their card is published immediately, as for any worker.
 - multinode deployments, whose followers have no probes;
 - container-mode Kubernetes discovery;
 - Dynamo running as a sidecar (`SystemProbePolicy::RuntimeOnly`), which is rejected at startup because

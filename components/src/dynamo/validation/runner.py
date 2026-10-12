@@ -15,12 +15,17 @@ from the request body, and answers ``{"pass": true}`` or
 The runner keeps no state between requests: the worker owns every verdict, and
 a restarted worker simply asks again. It binds loopback only, has no probes and
 never exits on a failed check, so it can't make a released pod NotReady.
+
+A check inherits the runner's environment plus the gate variables: the sidecar
+container is the check's environment, so put a check's credentials there. The
+worker can only set the three gate variables.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import logging
 import os
 import shlex
@@ -37,6 +42,28 @@ BUILTIN_PREFIX = "builtin:"
 BUILTINS = {"completion": [sys.executable, "-m", "dynamo.validation.completion"]}
 # Only these request-body keys are passed to the check.
 GATE_ENV_KEYS = ("OPENAI_BASE_URL", "DYN_VALIDATION_MODEL", "DYN_VALIDATION_GATE")
+
+
+def loopback_host(value: str) -> str:
+    """The runner runs arbitrary commands, so it must not be reachable off-pod."""
+    try:
+        if value == "localhost" or ipaddress.ip_address(value).is_loopback:
+            return value
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(
+        f"--host must be a loopback address (127.0.0.1, ::1 or localhost), got {value!r}"
+    )
+
+
+async def _read_tail(stream: asyncio.StreamReader, limit: int) -> bytes:
+    """Read a stream to its end, keeping only the last ``limit`` bytes."""
+    tail = bytearray()
+    while chunk := await stream.read(4096):
+        tail += chunk
+        if len(tail) > limit:
+            del tail[:-limit]
+    return bytes(tail)
 
 
 def parse_check(spec: str) -> tuple[str, list[str]]:
@@ -71,19 +98,26 @@ async def run_check(
     except OSError as error:
         return f"could not run {argv[0]!r}: {error}"
 
+    assert process.stderr is not None
     try:
-        _, stderr = await asyncio.wait_for(process.communicate(), timeout)
+        tail_bytes, _ = await asyncio.wait_for(
+            asyncio.gather(
+                _read_tail(process.stderr, STDERR_TAIL_BYTES), process.wait()
+            ),
+            timeout,
+        )
     except asyncio.TimeoutError:
         await _kill_group(process)
         return f"no verdict within {timeout}s"
     except asyncio.CancelledError:
-        # Shutting down: no check outlives the runner.
+        # The worker gave up on this gate (its deadline passed) or the runner
+        # is shutting down: no check outlives its request.
         await _kill_group(process)
         raise
 
     if process.returncode == 0:
         return None
-    tail = stderr[-STDERR_TAIL_BYTES:].decode(errors="replace").strip()
+    tail = tail_bytes.decode(errors="replace").strip()
     status = (
         f"exited with status {process.returncode}"
         if process.returncode > 0
@@ -97,7 +131,7 @@ async def _kill_group(process: asyncio.subprocess.Process) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
-        pass
+        pass  # Already gone; there is nothing left to kill.
     await process.wait()
 
 
@@ -118,12 +152,14 @@ def build_app(
         except ValueError:
             body = {}
         env = {key: str(body[key]) for key in GATE_ENV_KEYS if key in body}
-        logger.info("Running check %s: %s", name, shlex.join(argv))
+        # %r: the name comes from the URL and the reason from the check's
+        # stderr, so neither may inject line breaks into the log.
+        logger.info("Running check %r: %s", name, shlex.join(argv))
         reason = await run_check(argv, env, timeout)
         if reason is None:
-            logger.info("Check %s passed", name)
+            logger.info("Check %r passed", name)
             return web.json_response({"pass": True})
-        logger.warning("Check %s failed: %s", name, reason)
+        logger.warning("Check %r failed: %r", name, reason)
         return web.json_response({"pass": False, "reason": reason})
 
     app = web.Application()
@@ -133,7 +169,7 @@ def build_app(
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="127.0.0.1", type=loopback_host)
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument(
         "--check",
@@ -159,8 +195,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info(
         "Check runner serving %s on %s:%d", ", ".join(checks), args.host, args.port
     )
+    # handler_cancellation: when the worker drops a request (its gate deadline
+    # passed), the handler is cancelled and the check is killed rather than
+    # left running.
     web.run_app(
-        build_app(checks, args.timeout), host=args.host, port=args.port, print=None
+        build_app(checks, args.timeout),
+        host=args.host,
+        port=args.port,
+        print=None,
+        handler_cancellation=True,
     )
 
 

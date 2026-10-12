@@ -1710,6 +1710,9 @@ mod integration_tests {
                         env_system::DYN_SYSTEM_STARTING_HEALTH_STATUS,
                         Some(starting_status),
                     ),
+                    // The test hardcodes the default paths below.
+                    (env_system::DYN_SYSTEM_HEALTH_PATH, None),
+                    (env_system::DYN_SYSTEM_LIVE_PATH, None),
                 ],
                 async {
                     let drt = Arc::new(create_test_drt_async().await);

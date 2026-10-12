@@ -12,6 +12,13 @@ from dynamo.validation import completion
 pytestmark = [pytest.mark.gpu_0, pytest.mark.pre_merge, pytest.mark.unit]
 
 
+@pytest.fixture(autouse=True)
+def _no_proxy(monkeypatch):
+    """urllib honours an ambient proxy even for 127.0.0.1; keep the stub local."""
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _serve(status: int, payload: dict):
     seen = {}
 
@@ -45,6 +52,7 @@ def _choice(message: dict) -> dict:
     [
         {"role": "assistant", "content": "ready"},
         {"role": "assistant", "content": None, "reasoning_content": "thinking"},
+        {"role": "assistant", "content": None, "reasoning": "thinking"},
         {
             "role": "assistant",
             "content": None,
@@ -60,6 +68,7 @@ def test_pass(message):
         assert seen["body"]["model"] == "m"
     finally:
         server.shutdown()
+        server.server_close()
 
 
 @pytest.mark.parametrize(
@@ -67,6 +76,7 @@ def test_pass(message):
     [
         (200, _choice({"role": "assistant", "content": ""}), "empty message"),
         (200, {"choices": []}, "no choices"),
+        (200, [], "not an object"),
         (503, {"error": "engine not registered"}, "HTTP 503"),
     ],
 )
@@ -77,6 +87,7 @@ def test_fail(status, payload, expected):
         assert reason is not None and expected in reason, reason
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_unreachable():

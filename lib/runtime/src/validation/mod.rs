@@ -39,6 +39,10 @@ pub const PUBLISH_GATE: &str = "publish";
 /// worker stays held and the error is reported as the [`PUBLISH_GATE`] gate.
 pub type ReleaseHook = Box<dyn FnOnce() -> BoxFuture<'static, anyhow::Result<()>> + Send>;
 
+/// Undo work when a release hook fails, for example unregistering model cards
+/// that earlier hooks had written. Best effort; the worker is held regardless.
+pub type RollbackHook = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+
 /// Environment passed to every gate.
 #[derive(Clone, Debug, Default)]
 pub struct GateEnv {
@@ -106,6 +110,7 @@ pub struct WorkerValidation {
     config: ValidationConfig,
     gates: parking_lot::Mutex<BTreeMap<String, GateStatus>>,
     release_hooks: parking_lot::Mutex<Vec<ReleaseHook>>,
+    rollback_hooks: parking_lot::Mutex<Vec<RollbackHook>>,
     released: watch::Sender<bool>,
     started: AtomicBool,
     local_endpoint_claimed: AtomicBool,
@@ -140,6 +145,7 @@ impl WorkerValidation {
             config,
             gates: parking_lot::Mutex::new(gates),
             release_hooks: parking_lot::Mutex::new(Vec::new()),
+            rollback_hooks: parking_lot::Mutex::new(Vec::new()),
             released: watch::channel(false).0,
             started: AtomicBool::new(false),
             local_endpoint_claimed: AtomicBool::new(false),
@@ -182,10 +188,22 @@ impl WorkerValidation {
         true
     }
 
+    /// Run `hook` if any release hook fails, after the failure. Rollbacks run
+    /// in registration order and their outcome doesn't change the verdict.
+    pub fn add_rollback_hook(&self, hook: RollbackHook) {
+        self.rollback_hooks.lock().push(hook);
+    }
+
     /// Claim the right to serve the loopback endpoint that gates check. Only
     /// the first caller gets `true`; a worker serves one model to its gates.
     pub fn claim_local_endpoint(&self) -> bool {
         !self.local_endpoint_claimed.swap(true, Ordering::SeqCst)
+    }
+
+    /// Give a claim back when the endpoint could not be started, so a later
+    /// card can try.
+    pub fn release_local_endpoint_claim(&self) {
+        self.local_endpoint_claimed.store(false, Ordering::SeqCst);
     }
 
     /// Gate state for the `/health` body.
@@ -256,7 +274,7 @@ impl WorkerValidation {
     }
 
     async fn run(self: Arc<Self>, env: GateEnv, cancel: tokio_util::sync::CancellationToken) {
-        let client = reqwest::Client::new();
+        let client = runner::url_client();
         let runs = self.config.gates.iter().map(|gate| {
             let this = Arc::clone(&self);
             let env = env.clone();
@@ -309,6 +327,10 @@ impl WorkerValidation {
                     let reason = format!("{error:#}");
                     tracing::error!(%reason, "Validation release failed; worker stays held");
                     self.set_state(PUBLISH_GATE, GateState::Failed { reason }, None);
+                    let rollbacks = std::mem::take(&mut *self.rollback_hooks.lock());
+                    for rollback in rollbacks {
+                        rollback().await;
+                    }
                     return;
                 }
             }
@@ -459,14 +481,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_release_hook_fails_closed() {
+    async fn failed_release_hook_fails_closed_and_runs_rollbacks() {
         let validation = validation(r#"{"a": {"exec": ["true"], "timeout_secs": 5}}"#);
+        let rolled_back = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&rolled_back);
+        validation.add_rollback_hook(Box::new(move || {
+            Box::pin(async move { flag.store(true, Ordering::SeqCst) })
+        }));
         validation.add_release_hook(Box::new(|| {
             Box::pin(async { Err(anyhow::anyhow!("discovery write failed")) })
         }));
         validation.start(GateEnv::default(), CancellationToken::new());
         for _ in 0..200 {
-            if validation.status_json()["gates"][PUBLISH_GATE]["state"] == "failed" {
+            if rolled_back.load(Ordering::SeqCst) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -474,6 +501,20 @@ mod tests {
         let status = validation.status_json();
         assert_eq!(status["gates"][PUBLISH_GATE]["state"], "failed", "{status}");
         assert!(!validation.is_released());
+        assert!(rolled_back.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rollbacks_do_not_run_on_a_clean_release() {
+        let validation = validation(r#"{"a": {"exec": ["true"], "timeout_secs": 5}}"#);
+        let rolled_back = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&rolled_back);
+        validation.add_rollback_hook(Box::new(move || {
+            Box::pin(async move { flag.store(true, Ordering::SeqCst) })
+        }));
+        validation.start(GateEnv::default(), CancellationToken::new());
+        validation.wait_released().await;
+        assert!(!rolled_back.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -29,7 +29,19 @@ def test_parse_check_rejects_bad_specs(spec):
         runner.parse_check(spec)
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.1.2.3", "::1", "localhost"])
+def test_loopback_host_accepts_loopback(host):
+    assert runner.loopback_host(host) == host
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "10.0.0.1", "::", "checks.svc"])
+def test_loopback_host_rejects_the_rest(host):
+    with pytest.raises(argparse.ArgumentTypeError):
+        runner.loopback_host(host)
+
+
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_run_check_pass_fail_and_env():
     assert await runner.run_check(["true"], {}, None) is None
     reason = await runner.run_check(
@@ -47,12 +59,14 @@ async def test_run_check_pass_fail_and_env():
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_run_check_missing_program():
     reason = await runner.run_check(["/nonexistent/check"], {}, None)
     assert reason.startswith("could not run")
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_run_check_timeout_kills_the_process_group(tmp_path):
     marker = tmp_path / "survived"
     reason = await runner.run_check(
@@ -64,6 +78,37 @@ async def test_run_check_timeout_kills_the_process_group(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_run_check_cancellation_kills_the_process_group(tmp_path):
+    marker = tmp_path / "survived"
+    task = asyncio.create_task(
+        runner.run_check(
+            ["sh", "-c", f"(sleep 1; touch {marker}) & sleep 30"], {}, None
+        )
+    )
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(1.5)
+    assert not marker.exists(), "a child of the cancelled check survived"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_run_check_keeps_only_the_stderr_tail():
+    reason = await runner.run_check(
+        ["sh", "-c", "head -c 100000 /dev/zero | tr '\\0' a >&2; echo END >&2; exit 1"],
+        {},
+        None,
+    )
+    assert reason is not None
+    assert len(reason) < runner.STDERR_TAIL_BYTES + 64, len(reason)
+    assert reason.endswith("END")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_http_verdicts():
     app = runner.build_app(
         {

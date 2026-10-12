@@ -491,7 +491,7 @@ pub async fn register_model_card(
     // Under worker validation the discovery write may be held until release.
     // Capacity is still recorded now: it sizes this process, not routing.
     if let Some(spec) =
-        crate::validation_hold::hold_card(endpoint, model_suffix.as_deref(), spec).await
+        crate::validation_hold::hold_card(endpoint, model_suffix.as_deref(), spec).await?
     {
         let _instance = discovery.register(spec).await?;
     }

@@ -98,7 +98,7 @@ def _wait_for(
             if predicate():
                 return
         except (requests.RequestException, ValueError):
-            pass
+            pass  # Not up yet, or a half-written response; poll again.
         time.sleep(0.5)
     raise AssertionError(f"timed out waiting for {what}")
 
@@ -214,17 +214,21 @@ def test_passing_gates_release_the_worker(
                 lambda: _gate_state(system_port, "completion") == "passed",
                 "the completion gate to pass through the loopback endpoint",
             )
-            # Still held by the manual gate: not ready and not routable.
+            # Still held by the manual gate: not ready and not routable. The
+            # frontend has no card for the model, so it reports it unknown.
             status, body = _health(system_port)
             assert status == 503, body
             assert not _model_listed(frontend_port)
-            assert _chat(frontend_port).status_code != 200
+            assert _chat(frontend_port).status_code == 404
+            # The completion gate's own request went through the loopback
+            # endpoint, not the frontend; the client request must not have.
+            served_while_held = _generate_requests(system_port)
 
             flag.touch()
             _wait_for(lambda: _health(system_port)[0] == 200, "release")
             _wait_for(lambda: _model_listed(frontend_port), "the released card")
             assert _chat(frontend_port).status_code == 200
-            assert _generate_requests(system_port) >= 1
+            assert _generate_requests(system_port) == served_while_held + 1
 
 
 @pytest.mark.parametrize("num_system_ports", [1], indirect=True)
